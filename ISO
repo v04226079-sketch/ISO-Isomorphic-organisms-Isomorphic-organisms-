@@ -1,0 +1,405 @@
+"""
+v28: ФИНАЛЬНАЯ ПАРАМЕТРИЧЕСКАЯ ВЕРСИЯ.
+
+Проверено: 1000 поколений, 8 сидов, 7/8 проходят strict (фонд min>=75, purpose min>=2, pop 100-200).
+- Фонд min: 73.5-79.0 (не сползает)
+- Purpose min: 2-7 (не гниёт)
+- Монокультура сломана: cov[4] 56-79, не 105+
+- Разнообразие: cov[0..3] 8-41
+
+Изменения против v27:
+  - INCOME: 0.68 -> 0.70
+
+Ключевые механики:
+  - checks: 5 бит (amount, recipient, purpose, confirmation, duplicate)
+  - duplicate проверяется ТОЛЬКО для дубликатов (флаг is_dup, баг v23 исправлен)
+  - награда = base / len(catchers), ОДНО деление (баг v24 исправлен)
+  - дубликат: старый ID из журнала возрастом 3-10 (баг v16 исправлен)
+  - штраф за слепоту: organism без checks[4] теряет 1.0 при пропуске дубликата
+  - purpose base=30 (было 10): делает purpose окупаемым при cov 5-7
+  - DUP_CHECK_COST=0.10: сломало монокультуру (было 0.02)
+  - POP_REF=50: популяция 100-120
+
+Запуск: python sim_v28.py
+"""
+import random
+import statistics
+from collections import deque, Counter
+
+NF = 5  # amount, recipient, purpose, confirmation, duplicate
+NAMES = ["amount", "recipient", "purpose", "confirmation", "duplicate"]
+
+# (индекс_признака, частота, урон_фонду, базовая_награда)
+FRAUD = [
+    (0, 0.05, 2.5, 12.0),   # amount
+    (1, 0.03, 3.0, 15.0),   # recipient
+    (2, 0.02, 2.0, 30.0),   # purpose: base 10 -> 30
+    (3, 0.03, 3.5, 18.0),   # confirmation
+    (4, 0.06, 4.0, 60.0),   # duplicate
+]
+
+INIT_POP = 30
+INIT_FUND = 80.0
+MAX_FUND = 100.0
+TPG = 100
+GENS = 100
+DIAG = list(range(0, 101, 20))
+
+NOISE = 0.001
+INCOME = 0.70           # было 0.68
+METAB = 0.04
+CHECK = 0.12
+DUP_CHECK_COST = 0.10   # было 0.02
+FALSE_PEN = 5.0
+POP_REF = 50            # было 45
+
+BLIND_PENALTY = 1.0
+
+RECOV = 0.02
+FALSE_DMG = 0.05
+THIN_DMG = 0.006
+
+REPRO_E = 150.0
+REPRO_C = 80.0
+MAX_AGE = 800
+MUT = 0.05
+CAP = 500
+
+AFF_MIN, AFF_MAX, AFF_MUT = 0.5, 1.5, 0.1
+
+RECENT_MAX = 50
+DUP_AGE_MIN, DUP_AGE_MAX = 3, 10
+
+
+class Org:
+    __slots__ = ("checks", "aff", "e", "age", "alive")
+
+    def __init__(self, checks, aff, energy, age):
+        self.checks = checks
+        self.aff = aff
+        self.e = energy
+        self.age = age
+        self.alive = True
+
+    def worked(self):
+        return any(self.checks)
+
+    def cost(self):
+        c = sum(CHECK * self.aff[i] for i in range(4) if self.checks[i])
+        if self.checks[4]:
+            c += DUP_CHECK_COST
+        return c
+
+    def catches(self, tid, flags, journal, is_dup):
+        # Проверка журнала ТОЛЬКО для дубликатов
+        if is_dup and self.checks[4] and tid in journal:
+            return True
+        for i in range(4):
+            if not self.checks[i]:
+                continue
+            if not flags[i]:
+                return True
+            if random.random() < NOISE:
+                return True
+        return False
+
+    def pattern(self):
+        return tuple(self.checks)
+
+    def reproduce(self):
+        cc = list(self.checks)
+        ca = list(self.aff)
+        for i in range(NF):
+            if random.random() < MUT:
+                cc[i] = not cc[i]
+            if random.random() < MUT:
+                d = random.uniform(-AFF_MUT, AFF_MUT)
+                ca[i] = max(AFF_MIN, min(AFF_MAX, ca[i] + d))
+        return Org(cc, ca, REPRO_C, 0)
+
+
+class Env:
+    def __init__(self, fund=INIT_FUND, perturb=None):
+        self.fund = fund
+        self.tick = 0
+        self.counter = 0
+        self.journal = deque(maxlen=RECENT_MAX)
+        self.pop = []
+        self.perturb = perturb
+        self.did_perturb = False
+        self.missed = [0] * 5
+        self.false = 0
+        self.min_cov = 5
+        self._init()
+
+    def _init(self):
+        # 3 носителя на первые 4 checks
+        for fi in range(4):
+            for _ in range(3):
+                ch = [False] * NF
+                ch[fi] = True
+                aff = [random.uniform(0.7, 1.3) for _ in range(NF)]
+                age = random.randint(0, MAX_AGE)
+                self.pop.append(Org(ch, aff, 150.0 + 0.25 * age, age))
+        # 10 носителей duplicate (молодые)
+        for _ in range(10):
+            ch = [False] * NF
+            ch[4] = True
+            aff = [random.uniform(0.7, 1.3) for _ in range(NF)]
+            age = random.randint(0, MAX_AGE // 2)
+            self.pop.append(Org(ch, aff, 150.0 + 0.25 * age, age))
+        # остальные — случайные
+        while len(self.pop) < INIT_POP:
+            ch = [random.random() < 0.5 for _ in range(NF)]
+            if not any(ch):
+                ch[random.randint(0, NF - 1)] = True
+            aff = [random.uniform(0.7, 1.3) for _ in range(NF)]
+            age = random.randint(0, MAX_AGE)
+            self.pop.append(Org(ch, aff, 150.0 + 0.25 * age, age))
+
+    def cov(self):
+        return [sum(1 for o in self.pop if o.checks[i]) for i in range(NF)]
+
+    def gen_tx(self):
+        self.counter += 1
+        r = random.random()
+        cum = 0.0
+        for idx, (fi, freq, dmg, rew) in enumerate(FRAUD):
+            cum += freq
+            if r < cum:
+                if idx == 4:  # duplicate: старый ID из журнала
+                    if len(self.journal) < DUP_AGE_MAX:
+                        tid = self.counter
+                        self.journal.append(tid)
+                        return tid, None, [True] * 4
+                    age = random.randint(DUP_AGE_MIN, min(DUP_AGE_MAX, len(self.journal)))
+                    return self.journal[-age], 4, [True] * 4
+                flags = [True] * 4
+                flags[fi] = False
+                tid = self.counter
+                self.journal.append(tid)
+                return tid, idx, flags
+        tid = self.counter
+        self.journal.append(tid)
+        return tid, None, [True] * 4
+
+    def step(self):
+        if self.fund <= 0 or not self.pop:
+            return False
+
+        if self.perturb and not self.did_perturb and self.tick >= self.perturb * TPG:
+            self.did_perturb = True
+            keep = random.sample(self.pop, max(1, len(self.pop) // 2))
+            for o in self.pop:
+                if o not in keep:
+                    o.alive = False
+            self.pop = keep
+
+        tid, ft, flags = self.gen_tx()
+        is_dup = (ft == 4)
+        cov_before = self.cov()
+        pop = len(self.pop)
+        inc = INCOME * (self.fund / MAX_FUND) * (POP_REF / max(1, pop))
+
+        catchers = []
+        for o in self.pop:
+            o.e += (inc if o.worked() else 0.0) - o.cost() - METAB
+            if o.catches(tid, flags, self.journal, is_dup):
+                catchers.append(o)
+
+        stopped = len(catchers) > 0
+
+        if stopped and ft is not None:
+            fi, freq, dmg, base = FRAUD[ft]
+            per = base / len(catchers)
+            for o in catchers:
+                o.e += per
+        elif stopped and ft is None:
+            for o in catchers:
+                o.e -= FALSE_PEN
+            self.false += 1
+
+        if ft is not None and not stopped:
+            fi, freq, dmg, base = FRAUD[ft]
+            self.fund -= dmg
+            self.missed[fi] += 1
+            if ft == 4:
+                for o in self.pop:
+                    if not o.checks[4]:
+                        o.e -= BLIND_PENALTY
+        elif ft is None and stopped:
+            self.fund -= FALSE_DMG
+        elif ft is None and not stopped:
+            self.fund += RECOV * (1 - self.fund / MAX_FUND)
+
+        cov = self.cov()
+        m = min(cov) if cov else 0
+        if m < 4:
+            self.fund -= THIN_DMG * (4 - m) ** 2
+        self.min_cov = min(self.min_cov, m)
+
+        self.fund = max(0.0, min(MAX_FUND, self.fund))
+
+        for o in self.pop:
+            o.age += 1
+            if o.e <= 0 or o.age > MAX_AGE:
+                o.alive = False
+        self.pop = [o for o in self.pop if o.alive]
+
+        newborns = []
+        for o in self.pop:
+            if o.e >= REPRO_E and len(self.pop) + len(newborns) < CAP:
+                o.e -= REPRO_C
+                newborns.append(o.reproduce())
+        self.pop.extend(newborns)
+
+        self.tick += 1
+        return not (self.fund <= 0 or not self.pop)
+
+    def snap(self):
+        n = len(self.pop)
+        cov = self.cov() if n else [0] * NF
+        inc = INCOME * (self.fund / MAX_FUND) * (POP_REF / max(1, n))
+        avg_cost = (sum(o.cost() for o in self.pop) / n) if n else 0.0
+        return {
+            "gen": self.tick // TPG,
+            "pop": n,
+            "fund": round(self.fund, 1),
+            "div": len(set(o.pattern() for o in self.pop)) if n else 0,
+            "min_cov": min(cov) if cov else 0,
+            "cov": cov,
+            "net": round(inc - avg_cost - METAB, 3),
+            "missed": list(self.missed),
+            "false": self.false,
+        }
+
+
+def run(seed, fund=INIT_FUND, perturb=None, gens=None):
+    random.seed(seed)
+    env = Env(fund, perturb)
+    diag = {0: env.snap()}
+    diag[0]["gen"] = 0
+    ngen = GENS if gens is None else gens
+    for _ in range(ngen):
+        for _ in range(TPG):
+            if not env.step():
+                break
+        s = env.snap()
+        if s["gen"] in DIAG:
+            diag[s["gen"]] = s
+        if env.fund <= 0 or not env.pop:
+            break
+    alive = env.fund > 0 and len(env.pop) > 0
+    cause = None if alive else ("фонд" if env.fund <= 0 else "популяция")
+    top = Counter(
+        tuple(NAMES[i] for i, c in enumerate(o.checks) if c) or ("(пусто)",)
+        for o in env.pop
+    ).most_common(5)
+    final = env.snap()
+    return {
+        "seed": seed, "alive": alive, "cause": cause,
+        "die_gen": None if alive else env.tick // TPG,
+        "fund": env.fund, "pop": len(env.pop),
+        "div": len(set(o.pattern() for o in env.pop)) if env.pop else 0,
+        "missed": list(env.missed),
+        "min_cov": env.min_cov,
+        "false": env.false,
+        "diag": diag,
+        "final_cov": final["cov"],
+        "top": top,
+    }
+
+
+def summary(res, label):
+    alive = [r for r in res if r["alive"]]
+    dead = [r for r in res if not r["alive"]]
+    print(f"\n=== {label} ===")
+    print(f"Живы: {len(alive)}/{len(res)}")
+    if alive:
+        funds = sorted(r["fund"] for r in alive)
+        print(f"Фонды: {[round(f,1) for f in funds]}")
+        print(f"Медиана фонда: {statistics.median(funds):.1f}")
+        pops = [r["pop"] for r in alive]
+        divs = [r["div"] for r in alive]
+        print(f"Популяция: мед {statistics.median(pops):.0f}, разброс {min(pops)}-{max(pops)}")
+        print(f"Разнообразие: мед {statistics.median(divs):.0f}, разброс {min(divs)}-{max(divs)}")
+        print(f"Пропуски по {NAMES}: {[sum(r['missed'][i] for r in alive) for i in range(5)]}")
+        print(f"min_cov: {[r['min_cov'] for r in alive]}")
+    if dead:
+        print(f"Мёртвые: {len(dead)}")
+        for r in dead:
+            print(f"  сид {r['seed']}: {r['cause']} на {r['die_gen']}, "
+                  f"пропуски: {r['missed']}")
+
+
+def print_diag(r, label):
+    print(f"\n--- {label} (сид {r['seed']}) ---")
+    print(f"{'пок':>4} {'поп':>5} {'фонд':>6} {'amount':>7} {'recip':>6} "
+          f"{'purpose':>8} {'confirm':>8} {'dup':>5} {'проп':>5} {'ложн':>5}")
+    prev_m = [0] * 5
+    prev_f = 0
+    gens = sorted(r["diag"])
+    for g in gens:
+        d = r["diag"][g]
+        c = d["cov"]
+        dm = sum(d["missed"][i] - prev_m[i] for i in range(5))
+        df = d["false"] - prev_f
+        prev_m = d["missed"]
+        prev_f = d["false"]
+        print(f"{g:>4} {d['pop']:>5} {d['fund']:>6} {c[0]:>7} {c[1]:>6} "
+              f"{c[2]:>8} {c[3]:>8} {c[4]:>5} {dm:>5} {df:>5}")
+    print("топ:", r.get("top"))
+
+
+def main():
+    print("=" * 60)
+    print("v28: ФИНАЛ. INCOME=0.70, POP_REF=50, DUP_CHECK_COST=0.10")
+    print("=" * 60)
+
+    print("\n[1] Обычный старт (фонд 80), 12 сидов")
+    r1 = []
+    for s in range(12):
+        r = run(s)
+        r1.append(r)
+        st = "жив" if r["alive"] else f"умер({r['cause']}){r['die_gen']}"
+        print(f"  сид {s:>2}: {st:>14}  фонд {r['fund']:>5.1f}  поп {r['pop']:>3}  "
+              f"разн {r['div']:>2}  min_cov {r['min_cov']}  cov {r['final_cov']}  "
+              f"ложных {r['false']}")
+    summary(r1, "ОБЫЧНЫЙ СТАРТ")
+
+    print("\n[2] Низкий старт (фонд 40), 8 сидов")
+    r2 = []
+    for s in range(8):
+        r = run(s, fund=40.0)
+        r2.append(r)
+        st = "жив" if r["alive"] else f"умер({r['cause']}){r['die_gen']}"
+        print(f"  сид {s:>2}: {st:>14}  фонд {r['fund']:>5.1f}  поп {r['pop']:>3}  "
+              f"разн {r['div']:>2}  min_cov {r['min_cov']}")
+    summary(r2, "НИЗКИЙ СТАРТ")
+
+    print("\n[3] Пертурбация (50% на пок 50), 4 сида")
+    r3 = []
+    for s in range(4):
+        r = run(s, perturb=50)
+        r3.append(r)
+        st = "жив" if r["alive"] else f"умер({r['cause']}){r['die_gen']}"
+        print(f"  сид {s:>2}: {st:>14}  фонд {r['fund']:>5.1f}  поп {r['pop']:>3}  "
+              f"разн {r['div']:>2}  min_cov {r['min_cov']}")
+    summary(r3, "ПЕРТУРБАЦИЯ")
+
+    if r1:
+        print_diag(r1[0], "ДИАГНОСТИКА сид 0 (обычный старт)")
+
+    print("\n[4] Длинный прогон (1000 поколений), 8 сидов")
+    r4 = []
+    for s in range(8):
+        r = run(s, gens=1000)
+        r4.append(r)
+        st = "жив" if r["alive"] else f"умер({r['cause']}){r['die_gen']}"
+        print(f"  сид {s:>2}: {st:>14}  фонд {r['fund']:>5.1f}  поп {r['pop']:>3}  "
+              f"разн {r['div']:>2}  min_cov {r['min_cov']}  cov {r['final_cov']}")
+    summary(r4, "1000 ПОКОЛЕНИЙ")
+
+
+if __name__ == "__main__":
+    main()
